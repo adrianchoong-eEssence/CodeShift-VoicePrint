@@ -1,5 +1,6 @@
 import streamlit as st
 from openai import OpenAI
+import os
 import tempfile
 import json
 import re
@@ -9,12 +10,133 @@ import numpy as np
 import matplotlib.pyplot as plt
 from fpdf import FPDF
 
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+except Exception:
+    gspread = None
+    Credentials = None
+
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
 st.set_page_config(
     page_title="CodeShift Identity Blueprint",
     layout="centered"
 )
+
+# =========================
+# Corporate Mode Settings
+# =========================
+
+GOOGLE_SHEET_NAME = "CodeShift VoicePrint Database"
+RESPONSES_TAB = "Responses"
+
+CLIENTS = {
+    "MAXIS2026": {
+        "company": "Maxis",
+        "programme": "Mission AI / CodeShift Identity Blueprint",
+        "quota": 40,
+    },
+    "AIA2026": {
+        "company": "AIA Malaysia",
+        "programme": "Mission AI / CodeShift Identity Blueprint",
+        "quota": 100,
+    },
+    "EESSENCE": {
+        "company": "eEssence Consultants",
+        "programme": "Internal Testing",
+        "quota": 9999,
+    },
+}
+
+SHEET_HEADERS = [
+    "Timestamp", "Access Code", "Company", "Programme", "Name", "Email",
+    "Age Range", "Occupation", "Department", "Role", "Alignment Index",
+    "Alignment Status", "Growth Potential", "Primary Archetype", "Primary Score",
+    "Secondary Archetype", "Secondary Score", "Shadow Archetype", "Shadow Score",
+    "Protection Strategy", "Hidden Code 1", "Hidden Code 1 Score",
+    "Hidden Code 2", "Hidden Code 2 Score", "Hidden Code 3", "Hidden Code 3 Score",
+    "Report Generated",
+]
+
+
+def normalise_code(code):
+    return str(code or "").strip().upper()
+
+
+def get_client(access_code):
+    code = normalise_code(access_code)
+    if code in CLIENTS:
+        return CLIENTS[code]
+    return {"company": "Unassigned", "programme": "Unassigned", "quota": 0}
+
+
+@st.cache_resource
+def get_google_worksheet():
+    """Connects to Google Sheets.
+
+    Local testing: put service-account.json in the same folder as app.py.
+    Streamlit Cloud: paste [google_service_account] into App Secrets.
+    """
+    if gspread is None or Credentials is None:
+        return None, "Google Sheets libraries are not installed."
+
+    try:
+        if os.path.exists("service-account.json"):
+            with open("service-account.json", "r") as file:
+                service_account_info = json.load(file)
+        else:
+            service_account_info = dict(st.secrets["google_service_account"])
+
+        if "private_key" in service_account_info:
+            service_account_info["private_key"] = service_account_info["private_key"].replace("\\n", "\n")
+
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        credentials = Credentials.from_service_account_info(service_account_info, scopes=scopes)
+        google_client = gspread.authorize(credentials)
+        spreadsheet = google_client.open(GOOGLE_SHEET_NAME)
+
+        try:
+            worksheet = spreadsheet.worksheet(RESPONSES_TAB)
+        except gspread.WorksheetNotFound:
+            worksheet = spreadsheet.add_worksheet(title=RESPONSES_TAB, rows=2000, cols=len(SHEET_HEADERS))
+
+        existing_headers = worksheet.row_values(1)
+        if existing_headers != SHEET_HEADERS:
+            worksheet.clear()
+            worksheet.append_row(SHEET_HEADERS)
+
+        return worksheet, None
+
+    except Exception as error:
+        return None, str(error)
+
+
+def count_completed(access_code):
+    worksheet, error = get_google_worksheet()
+    if worksheet is None:
+        return 0
+    try:
+        records = worksheet.get_all_records()
+        code = normalise_code(access_code)
+        return len([row for row in records if normalise_code(row.get("Access Code", "")) == code])
+    except Exception:
+        return 0
+
+
+def save_to_google_sheet(row_dict):
+    worksheet, error = get_google_worksheet()
+    if worksheet is None:
+        return False, error or "Google Sheet not connected."
+    try:
+        row = [row_dict.get(header, "") for header in SHEET_HEADERS]
+        worksheet.append_row(row, value_input_option="USER_ENTERED")
+        return True, "Saved"
+    except Exception as error:
+        return False, str(error)
 
 ARCHETYPES = {
     "Guardian": "Security & Stability",
@@ -449,214 +571,458 @@ def create_pdf(name, age, occupation, alignment, growth, align_status, scores, t
     return bytes(pdf_bytes)
 
 
-st.title("CodeShift Identity Blueprint")
-st.subheader("Powered by VoicePrint Analysis")
 
-st.info(
-    "This is a leadership and coaching reflection tool. It does not diagnose trauma, "
-    "medical conditions, mental health conditions or exact life events."
+# =========================
+# Streamlit Interface
+# =========================
+
+
+
+# =========================
+# Dashboard Utilities
+# =========================
+
+def _to_float(value, default=0):
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _average(values):
+    values = [_to_float(v) for v in values if str(v).strip() != ""]
+    if not values:
+        return 0
+    return round(sum(values) / len(values), 1)
+
+
+def load_records_for_dashboard():
+    worksheet, error = get_google_worksheet()
+    if worksheet is None:
+        st.error(f"Google Sheet not connected: {error}")
+        return []
+    try:
+        return worksheet.get_all_records()
+    except Exception as error:
+        st.error(f"Unable to load dashboard records: {error}")
+        return []
+
+
+def render_distribution(title, values):
+    st.subheader(title)
+    clean_values = [str(v).strip() for v in values if str(v).strip()]
+    if not clean_values:
+        st.info("No data yet.")
+        return
+
+    counts = Counter(clean_values)
+    total = sum(counts.values())
+
+    for label, count in counts.most_common():
+        pct = round((count / total) * 100)
+        st.write(f"**{label}** — {count} participant(s), {pct}%")
+        st.progress(pct / 100)
+
+
+def records_to_csv(records):
+    import csv
+    import io
+
+    if not records:
+        return ""
+
+    output = io.StringIO()
+    fieldnames = list(records[0].keys())
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(records)
+    return output.getvalue()
+
+
+def show_dashboard():
+    st.title("CodeShift Team Intelligence")
+    st.caption("Client dashboard for CodeShift Identity Blueprint results.")
+
+    dashboard_code = st.text_input("Dashboard Access Code", type="password").strip().upper()
+
+    if not dashboard_code:
+        st.info("Enter dashboard access code to view results.")
+        return
+
+    company_filter = None
+
+    if dashboard_code == "CODESHIFT-ADMIN":
+        company_filter = "ALL"
+    else:
+        for code, info in CLIENTS.items():
+            if dashboard_code == f"{code}-ADMIN" or dashboard_code == info.get("dashboard_code", ""):
+                company_filter = info["company"]
+                break
+
+    # Support hard-coded client admin codes for V1.4
+    if dashboard_code == "MAXIS-ADMIN":
+        company_filter = "Maxis"
+    if dashboard_code == "AIA-ADMIN":
+        company_filter = "AIA Malaysia"
+    if dashboard_code == "EESSENCE-ADMIN":
+        company_filter = "eEssence Consultants"
+
+    if company_filter is None:
+        st.error("Invalid dashboard access code.")
+        return
+
+    records = load_records_for_dashboard()
+
+    if company_filter != "ALL":
+        records = [
+            row for row in records
+            if str(row.get("Company", "")).strip() == company_filter
+        ]
+
+    if not records:
+        st.warning("No completed assessments found yet.")
+        return
+
+    company_label = company_filter if company_filter != "ALL" else "All Companies"
+    st.header(company_label)
+
+    completed = len(records)
+    avg_alignment = _average([r.get("Alignment Index", 0) for r in records])
+    avg_growth = _average([r.get("Growth Potential", 0) for r in records])
+
+    primary_values = [r.get("Primary Archetype", "") for r in records]
+    top_primary = Counter([v for v in primary_values if v]).most_common(1)
+    top_primary_label = top_primary[0][0] if top_primary else "-"
+
+    hidden_values = [r.get("Hidden Code 1", "") for r in records]
+    top_hidden = Counter([v for v in hidden_values if v]).most_common(1)
+    top_hidden_label = top_hidden[0][0] if top_hidden else "-"
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Completed", completed)
+    col2.metric("Avg Alignment", f"{avg_alignment}/100")
+    col3.metric("Avg Growth", f"{avg_growth}/100")
+    col4.metric("Top Archetype", top_primary_label)
+
+    st.info(f"Most common hidden code: **{top_hidden_label}**")
+
+    st.divider()
+    render_distribution("Archetype Composition", primary_values)
+
+    st.divider()
+    render_distribution("Top Hidden Codes", hidden_values)
+
+    st.divider()
+    render_distribution("Department Breakdown", [r.get("Department", "") for r in records])
+
+    st.divider()
+    st.subheader("Recent Submissions")
+    for row in records[-10:][::-1]:
+        st.write(
+            f"**{row.get('Name', '-')}** | "
+            f"{row.get('Department', '-')} | "
+            f"{row.get('Primary Archetype', '-')} | "
+            f"Alignment {row.get('Alignment Index', '-')}/100 | "
+            f"Growth {row.get('Growth Potential', '-')}/100"
+        )
+
+    st.divider()
+    csv_data = records_to_csv(records)
+    st.download_button(
+        label="Download Dashboard Data (CSV)",
+        data=csv_data,
+        file_name=f"codeshift_dashboard_{company_label.replace(' ', '_')}.csv",
+        mime="text/csv",
+    )
+
+
+def participant_view():
+    st.title("CodeShift Identity Blueprint")
+    st.subheader("Powered by VoicePrint Analysis")
+
+    st.info(
+        "This is a leadership and coaching reflection tool. It does not diagnose trauma, "
+        "medical conditions, mental health conditions or exact life events."
+    )
+
+    st.header("1. Access Details")
+    access_code = st.text_input("Access Code", placeholder="Example: MAXIS2026").strip().upper()
+    client_info = get_client(access_code)
+    company = client_info["company"]
+    programme = client_info["programme"]
+    quota = int(client_info.get("quota", 0) or 0)
+
+    if access_code:
+        if access_code in CLIENTS:
+            completed = count_completed(access_code)
+            st.success(f"Access confirmed: {company} - {programme}")
+            if quota > 0:
+                st.caption(f"Completed: {completed}/{quota}")
+                if completed >= quota:
+                    st.error("This access code has reached its assessment limit. Please contact eEssence Consultants.")
+        else:
+            st.warning("Access code not recognised. This test will still run, but it will be saved as Unassigned.")
+
+    st.header("2. Personal Details")
+    name = st.text_input("Full Name")
+    email = st.text_input("Email")
+    age = st.selectbox("Age Range", ["18-25", "26-35", "36-45", "46-55", "56+"])
+    occupation = st.text_input("Occupation / Role")
+    department = st.text_input("Department")
+    role = st.text_input("Job Title / Designation")
+
+    st.header("3. Life Alignment Score")
+    stress = st.slider("Stress Level", 1, 10, 5)
+    confidence = st.slider("Confidence Level", 1, 10, 5)
+    purpose = st.slider("Sense of Purpose", 1, 10, 5)
+    relationships = st.slider("Relationship Fulfilment", 1, 10, 5)
+    career = st.slider("Career Satisfaction", 1, 10, 5)
+    energy = st.slider("Energy Level", 1, 10, 5)
+    health = st.slider("Physical Wellbeing Reflection", 1, 10, 5)
+
+    st.header("4. VoicePrint Leadership Script")
+
+    with st.expander("Click here to view the script"):
+        st.markdown("""
+    Please read aloud and complete each sentence naturally.
+
+    1. A recent situation where I felt under pressure was ________.
+
+    2. When working with others, I become most frustrated when ________.
+
+    3. People often misunderstand me because ________.
+
+    4. When I make important decisions, I usually rely on ________.
+
+    5. I know I am successful when ________.
+
+    6. The kind of leader or person I am becoming is ________.
+
+    7. The pattern I most want to shift is ________.
+
+    8. If I fully stepped into my potential, I would ________.
+    """)
+
+    st.header("5. Record Your Voice")
+    voice_file = st.audio_input("Press record and read the script aloud")
+
+    consent = st.checkbox("I understand this is a coaching reflection report and not a diagnosis.")
+
+    if st.button("Generate CodeShift Identity Blueprint"):
+
+        if not access_code or not name or not email or not occupation or voice_file is None or not consent:
+            st.error("Please complete access code, all required fields, record your voice, and tick the consent box.")
+
+        elif access_code in CLIENTS and quota > 0 and count_completed(access_code) >= quota:
+            st.error("This access code has reached its assessment limit. Please contact eEssence Consultants.")
+
+        else:
+            with st.spinner("Transcribing voice..."):
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+                    tmp.write(voice_file.getvalue())
+                    audio_path = tmp.name
+
+                with open(audio_path, "rb") as audio:
+                    transcript = client.audio.transcriptions.create(
+                        model="gpt-4o-mini-transcribe",
+                        file=audio
+                    )
+
+                transcript_text = transcript.text
+
+            archetype_scores = score_archetypes(
+                transcript_text, stress, confidence, purpose, relationships, career, energy, health
+            )
+
+            code_scores = score_hidden_codes(
+                transcript_text, stress, confidence, purpose, relationships, career, energy, health
+            )
+
+            top_three = sorted(archetype_scores.items(), key=lambda x: x[1], reverse=True)[:3]
+            top_codes = sorted(code_scores.items(), key=lambda x: x[1], reverse=True)[:5]
+
+            alignment = alignment_index(stress, confidence, purpose, relationships, career, energy, health)
+            growth = growth_potential_index(confidence, purpose, energy)
+            align_status = alignment_status(alignment)
+
+            strategy = protection_strategy(top_three[0][0], top_codes)
+            os_profile = operating_system(top_three[0][0], top_three[1][0], top_three[2][0], top_codes)
+
+            audio_features = extract_audio_features(audio_path, transcript_text)
+            chart_path = create_radar_chart(archetype_scores)
+
+            prompt = f"""
+    You are a senior CodeShift Identity Blueprint Analyst.
+
+    Your role is not to summarise the participant.
+    Your role is to reveal the repeating CodeShift pattern behind how the participant currently leads, decides, responds to pressure and grows.
+
+    Important rules:
+    - Do not diagnose medical conditions.
+    - Do not diagnose mental health conditions.
+    - Do not claim trauma or exact trauma ages.
+    - Do not make clinical claims.
+    - Do not use generic AI consulting language.
+    - Do not include a disclaimer in the generated report.
+    - Use CodeShift language: Pattern, Tension, Blind Spot, Shift, Alignment.
+    - Be concise, direct, reflective and suitable for senior leaders.
+
+    Participant:
+    Name: {name}
+    Age Range: {age}
+    Occupation: {occupation}
+    Department: {department}
+    Role: {role}
+    Company: {company}
+    Programme: {programme}
+
+    Executive Scores:
+    Alignment Index: {alignment}/100
+    Alignment Status: {align_status}
+    Growth Potential: {growth}/100
+
+    Identity Stack:
+    Primary Archetype: {top_three[0][0]} - {ARCHETYPES[top_three[0][0]]}
+    Secondary Archetype: {top_three[1][0]} - {ARCHETYPES[top_three[1][0]]}
+    Shadow Archetype: {top_three[2][0]} - {ARCHETYPES[top_three[2][0]]}
+
+    Protection Strategy:
+    {strategy[0]} - {strategy[1]}
+
+    Leadership Operating System:
+    {json.dumps(os_profile, indent=2)}
+
+    Hidden Codes:
+    {json.dumps(dict(top_codes), indent=2)}
+
+    Voice Delivery Snapshot:
+    {json.dumps(audio_features, indent=2)}
+
+    Transcript:
+    {transcript_text}
+
+    Generate the report using this exact structure:
+
+    # The CodeShift Pattern
+    Explain the dominant repeating pattern driving this person right now. Do not repeat the scores. Make it feel like a mirror.
+
+    # The Tension
+    Explain the internal tension between the Primary, Secondary and Shadow Archetypes. Use simple language. Example: Catalyst wants movement, Guardian wants stability.
+
+    # The Blind Spot
+    Identify the pattern this person may not fully see in themselves. This should be the strongest insight.
+
+    # The Shift
+    Describe the shift that would unlock the next level of alignment and leadership effectiveness.
+
+    # Alignment Recommendation
+    Give exactly 3 concise recommendations for the next 30-90 days.
+
+    Tone:
+    - Premium
+    - Human
+    - CodeShift-branded
+    - No fluff
+    - No diagnosis
+    - No clinical language
+    - No disclaimer
+    """
+
+            with st.spinner("Generating Identity Blueprint..."):
+                response = client.responses.create(
+                    model="gpt-4.1",
+                    input=prompt
+                )
+                report = response.output_text
+
+            pdf_bytes = create_pdf(
+                name,
+                age,
+                occupation,
+                alignment,
+                growth,
+                align_status,
+                archetype_scores,
+                top_three,
+                top_codes,
+                strategy,
+                os_profile,
+                report,
+                chart_path
+            )
+
+            row_dict = {
+                "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "Access Code": access_code,
+                "Company": company,
+                "Programme": programme,
+                "Name": name,
+                "Email": email,
+                "Age Range": age,
+                "Occupation": occupation,
+                "Department": department,
+                "Role": role,
+                "Alignment Index": alignment,
+                "Alignment Status": align_status,
+                "Growth Potential": growth,
+                "Primary Archetype": top_three[0][0],
+                "Primary Score": top_three[0][1],
+                "Secondary Archetype": top_three[1][0],
+                "Secondary Score": top_three[1][1],
+                "Shadow Archetype": top_three[2][0],
+                "Shadow Score": top_three[2][1],
+                "Protection Strategy": strategy[0],
+                "Hidden Code 1": top_codes[0][0],
+                "Hidden Code 1 Score": top_codes[0][1],
+                "Hidden Code 2": top_codes[1][0],
+                "Hidden Code 2 Score": top_codes[1][1],
+                "Hidden Code 3": top_codes[2][0],
+                "Hidden Code 3 Score": top_codes[2][1],
+                "Report Generated": "Yes",
+            }
+            saved, save_message = save_to_google_sheet(row_dict)
+
+            st.success("CodeShift Identity Blueprint Generated")
+            if saved:
+                st.success("Participant saved to Google Sheet.")
+            else:
+                st.warning(f"Report generated, but Google Sheet save failed: {save_message}")
+
+            st.metric("Alignment Index", f"{alignment}/100")
+            st.metric("Growth Potential", f"{growth}/100")
+
+            st.subheader("Identity Stack")
+            st.write(f"Primary: **{top_three[0][0]}** — {ARCHETYPES[top_three[0][0]]}")
+            st.write(f"Secondary: **{top_three[1][0]}** — {ARCHETYPES[top_three[1][0]]}")
+            st.write(f"Shadow: **{top_three[2][0]}** — {ARCHETYPES[top_three[2][0]]}")
+
+            st.subheader("Protection Strategy")
+            st.write(f"**{strategy[0]}** — {strategy[1]}")
+
+            st.image(chart_path)
+
+            st.header("Executive Insight Report")
+            st.write(report)
+
+            st.download_button(
+                label="Download CodeShift Identity Blueprint PDF",
+                data=pdf_bytes,
+                file_name=f"{name.replace(' ', '_')}_CodeShift_Identity_Blueprint.pdf",
+                mime="application/pdf"
+            )
+
+
+
+# =========================
+# App Router
+# =========================
+
+mode = st.sidebar.radio(
+    "Mode",
+    ["Participant Assessment", "Client Dashboard"]
 )
 
-st.header("1. Personal Details")
-name = st.text_input("Full Name")
-email = st.text_input("Email")
-age = st.selectbox("Age Range", ["18-25", "26-35", "36-45", "46-55", "56+"])
-occupation = st.text_input("Occupation / Role")
-
-st.header("2. Life Alignment Score")
-stress = st.slider("Stress Level", 1, 10, 5)
-confidence = st.slider("Confidence Level", 1, 10, 5)
-purpose = st.slider("Sense of Purpose", 1, 10, 5)
-relationships = st.slider("Relationship Fulfilment", 1, 10, 5)
-career = st.slider("Career Satisfaction", 1, 10, 5)
-energy = st.slider("Energy Level", 1, 10, 5)
-health = st.slider("Physical Wellbeing Reflection", 1, 10, 5)
-
-st.header("3. VoicePrint Leadership Script")
-
-with st.expander("Click here to view the script"):
-    st.markdown("""
-Please read aloud and complete each sentence naturally.
-
-1. A recent situation where I felt under pressure was ________.
-
-2. When working with others, I become most frustrated when ________.
-
-3. People often misunderstand me because ________.
-
-4. When I make important decisions, I usually rely on ________.
-
-5. I know I am successful when ________.
-
-6. The kind of leader or person I am becoming is ________.
-
-7. The pattern I most want to shift is ________.
-
-8. If I fully stepped into my potential, I would ________.
-""")
-
-st.header("4. Record Your Voice")
-voice_file = st.audio_input("Press record and read the script aloud")
-
-consent = st.checkbox("I understand this is a coaching reflection report and not a diagnosis.")
-
-if st.button("Generate CodeShift Identity Blueprint"):
-
-    if not name or not email or not occupation or voice_file is None or not consent:
-        st.error("Please complete all fields, record your voice, and tick the consent box.")
-
-    else:
-        with st.spinner("Transcribing voice..."):
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-                tmp.write(voice_file.getvalue())
-                audio_path = tmp.name
-
-            with open(audio_path, "rb") as audio:
-                transcript = client.audio.transcriptions.create(
-                    model="gpt-4o-mini-transcribe",
-                    file=audio
-                )
-
-            transcript_text = transcript.text
-
-        archetype_scores = score_archetypes(
-            transcript_text, stress, confidence, purpose, relationships, career, energy, health
-        )
-
-        code_scores = score_hidden_codes(
-            transcript_text, stress, confidence, purpose, relationships, career, energy, health
-        )
-
-        top_three = sorted(archetype_scores.items(), key=lambda x: x[1], reverse=True)[:3]
-        top_codes = sorted(code_scores.items(), key=lambda x: x[1], reverse=True)[:5]
-
-        alignment = alignment_index(stress, confidence, purpose, relationships, career, energy, health)
-        growth = growth_potential_index(confidence, purpose, energy)
-        align_status = alignment_status(alignment)
-
-        strategy = protection_strategy(top_three[0][0], top_codes)
-        os_profile = operating_system(top_three[0][0], top_three[1][0], top_three[2][0], top_codes)
-
-        audio_features = extract_audio_features(audio_path, transcript_text)
-        chart_path = create_radar_chart(archetype_scores)
-
-        prompt = f"""
-You are a senior CodeShift Identity Blueprint Analyst.
-
-Your role is not to summarise the participant.
-Your role is to reveal the repeating CodeShift pattern behind how the participant currently leads, decides, responds to pressure and grows.
-
-Important rules:
-- Do not diagnose medical conditions.
-- Do not diagnose mental health conditions.
-- Do not claim trauma or exact trauma ages.
-- Do not make clinical claims.
-- Do not use generic AI consulting language.
-- Do not include a disclaimer in the generated report.
-- Use CodeShift language: Pattern, Tension, Blind Spot, Shift, Alignment.
-- Be concise, direct, reflective and suitable for senior leaders.
-
-Participant:
-Name: {name}
-Age Range: {age}
-Occupation: {occupation}
-
-Executive Scores:
-Alignment Index: {alignment}/100
-Alignment Status: {align_status}
-Growth Potential: {growth}/100
-
-Identity Stack:
-Primary Archetype: {top_three[0][0]} - {ARCHETYPES[top_three[0][0]]}
-Secondary Archetype: {top_three[1][0]} - {ARCHETYPES[top_three[1][0]]}
-Shadow Archetype: {top_three[2][0]} - {ARCHETYPES[top_three[2][0]]}
-
-Protection Strategy:
-{strategy[0]} - {strategy[1]}
-
-Leadership Operating System:
-{json.dumps(os_profile, indent=2)}
-
-Hidden Codes:
-{json.dumps(dict(top_codes), indent=2)}
-
-Voice Delivery Snapshot:
-{json.dumps(audio_features, indent=2)}
-
-Transcript:
-{transcript_text}
-
-Generate the report using this exact structure:
-
-# The CodeShift Pattern
-Explain the dominant repeating pattern driving this person right now. Do not repeat the scores. Make it feel like a mirror.
-
-# The Tension
-Explain the internal tension between the Primary, Secondary and Shadow Archetypes. Use simple language. Example: Catalyst wants movement, Guardian wants stability.
-
-# The Blind Spot
-Identify the pattern this person may not fully see in themselves. This should be the strongest insight.
-
-# The Shift
-Describe the shift that would unlock the next level of alignment and leadership effectiveness.
-
-# Alignment Recommendation
-Give exactly 3 concise recommendations for the next 30-90 days.
-
-Tone:
-- Premium
-- Human
-- CodeShift-branded
-- No fluff
-- No diagnosis
-- No clinical language
-- No disclaimer
-"""
-
-        with st.spinner("Generating Identity Blueprint..."):
-            response = client.responses.create(
-                model="gpt-4.1",
-                input=prompt
-            )
-            report = response.output_text
-
-        pdf_bytes = create_pdf(
-            name,
-            age,
-            occupation,
-            alignment,
-            growth,
-            align_status,
-            archetype_scores,
-            top_three,
-            top_codes,
-            strategy,
-            os_profile,
-            report,
-            chart_path
-        )
-
-        st.success("CodeShift Identity Blueprint Generated")
-
-        st.metric("Alignment Index", f"{alignment}/100")
-        st.metric("Growth Potential", f"{growth}/100")
-
-        st.subheader("Identity Stack")
-        st.write(f"Primary: **{top_three[0][0]}** — {ARCHETYPES[top_three[0][0]]}")
-        st.write(f"Secondary: **{top_three[1][0]}** — {ARCHETYPES[top_three[1][0]]}")
-        st.write(f"Shadow: **{top_three[2][0]}** — {ARCHETYPES[top_three[2][0]]}")
-
-        st.subheader("Protection Strategy")
-        st.write(f"**{strategy[0]}** — {strategy[1]}")
-
-        st.image(chart_path)
-
-        st.header("Executive Insight Report")
-        st.write(report)
-
-        st.download_button(
-            label="Download CodeShift Identity Blueprint PDF",
-            data=pdf_bytes,
-            file_name=f"{name.replace(' ', '_')}_CodeShift_Identity_Blueprint.pdf",
-            mime="application/pdf"
-        )
+if mode == "Participant Assessment":
+    participant_view()
+else:
+    show_dashboard()

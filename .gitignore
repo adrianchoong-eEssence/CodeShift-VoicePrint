@@ -1,0 +1,11 @@
+# Secrets
+*.json
+.streamlit/secrets.toml
+service-account.json
+
+# Python
+.venv/
+__pycache__/
+
+# macOS
+.DS_Store
