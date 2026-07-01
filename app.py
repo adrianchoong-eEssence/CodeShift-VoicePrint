@@ -6,6 +6,7 @@ import json
 import re
 import wave
 from datetime import datetime
+from collections import Counter
 import numpy as np
 import matplotlib.pyplot as plt
 from fpdf import FPDF
@@ -639,6 +640,155 @@ def records_to_csv(records):
     return output.getvalue()
 
 
+def _format_metric(value, suffix=""):
+    try:
+        number = float(value)
+        if number.is_integer():
+            return f"{int(number)}{suffix}"
+        return f"{round(number, 1)}{suffix}"
+    except Exception:
+        return f"{value}{suffix}"
+
+
+def _safe_float(value, default=0):
+    try:
+        if value in [None, "", "-"]:
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _top_label(values, fallback="-"):
+    clean = [str(v).strip() for v in values if str(v).strip()]
+    if not clean:
+        return fallback
+    return Counter(clean).most_common(1)[0][0]
+
+
+def _bar_distribution(title, values, max_items=10):
+    clean_values = [str(v).strip() for v in values if str(v).strip()]
+    total = len(clean_values)
+
+    st.subheader(title)
+
+    if total == 0:
+        st.info("No data available yet.")
+        return
+
+    counts = Counter(clean_values).most_common(max_items)
+
+    for label, count in counts:
+        percentage = round((count / total) * 100)
+        left, right = st.columns([3, 1])
+        with left:
+            st.write(f"**{label}**")
+            st.progress(percentage / 100)
+        with right:
+            st.write(f"{count} | {percentage}%")
+
+
+def _department_summary(records):
+    departments = {}
+
+    for row in records:
+        dept = str(row.get("Department", "Unassigned") or "Unassigned").strip()
+        if not dept:
+            dept = "Unassigned"
+
+        if dept not in departments:
+            departments[dept] = {
+                "count": 0,
+                "alignment": [],
+                "growth": [],
+                "primary": [],
+                "hidden": [],
+            }
+
+        departments[dept]["count"] += 1
+        departments[dept]["alignment"].append(_safe_float(row.get("Alignment Index", 0)))
+        departments[dept]["growth"].append(_safe_float(row.get("Growth Potential", 0)))
+        departments[dept]["primary"].append(row.get("Primary Archetype", ""))
+        departments[dept]["hidden"].append(row.get("Hidden Code 1", ""))
+
+    summary = []
+    for dept, data in departments.items():
+        summary.append({
+            "Department": dept,
+            "Participants": data["count"],
+            "Avg Alignment": _average(data["alignment"]),
+            "Avg Growth": _average(data["growth"]),
+            "Top Archetype": _top_label(data["primary"]),
+            "Top Hidden Code": _top_label(data["hidden"]),
+        })
+
+    return sorted(summary, key=lambda item: item["Participants"], reverse=True)
+
+
+def _make_team_context(records, company_label):
+    completed = len(records)
+    avg_alignment = _average([r.get("Alignment Index", 0) for r in records])
+    avg_growth = _average([r.get("Growth Potential", 0) for r in records])
+    primary_values = [r.get("Primary Archetype", "") for r in records]
+    hidden_values = [r.get("Hidden Code 1", "") for r in records]
+    departments = _department_summary(records)
+
+    archetype_counts = Counter([str(v).strip() for v in primary_values if str(v).strip()]).most_common()
+    hidden_counts = Counter([str(v).strip() for v in hidden_values if str(v).strip()]).most_common()
+
+    return {
+        "company": company_label,
+        "completed": completed,
+        "average_alignment": avg_alignment,
+        "average_growth": avg_growth,
+        "archetype_distribution": archetype_counts,
+        "hidden_code_distribution": hidden_counts,
+        "department_summary": departments,
+    }
+
+
+def _generate_team_insight(records, company_label):
+    context = _make_team_context(records, company_label)
+
+    prompt = f"""
+You are the CodeShift Team Intelligence Analyst.
+
+Analyse the following corporate team data and create a concise executive dashboard narrative.
+Do not sound clinical. Do not diagnose. Use corporate leadership language.
+Focus on working styles, collaboration, stress response, leadership implications and workshop recommendations.
+
+Team Data:
+{json.dumps(context, indent=2)}
+
+Generate the response using this exact structure:
+
+# Executive Summary
+A short paragraph describing the team identity pattern.
+
+# Team Strengths
+3 bullet points.
+
+# Collaboration Risks
+3 bullet points.
+
+# Stress & Pressure Pattern
+A short paragraph.
+
+# Leadership Recommendations
+3 practical recommendations.
+
+# Recommended Workshop Focus
+Recommend 2-3 workshop focus areas from: collaboration, working styles, stress management, communication, Mission AI, CodeShift Leadership, resilience, change readiness.
+"""
+
+    response = client.responses.create(
+        model="gpt-4.1",
+        input=prompt,
+    )
+
+    return response.output_text
+
+
 def show_dashboard():
     st.title("CodeShift Team Intelligence")
     st.caption("Client dashboard for CodeShift Identity Blueprint results.")
@@ -659,7 +809,6 @@ def show_dashboard():
                 company_filter = info["company"]
                 break
 
-    # Support hard-coded client admin codes for V1.4
     if dashboard_code == "MAXIS-ADMIN":
         company_filter = "Maxis"
     if dashboard_code == "AIA-ADMIN":
@@ -684,57 +833,149 @@ def show_dashboard():
         return
 
     company_label = company_filter if company_filter != "ALL" else "All Companies"
-    st.header(company_label)
 
     completed = len(records)
     avg_alignment = _average([r.get("Alignment Index", 0) for r in records])
     avg_growth = _average([r.get("Growth Potential", 0) for r in records])
 
     primary_values = [r.get("Primary Archetype", "") for r in records]
-    top_primary = Counter([v for v in primary_values if v]).most_common(1)
-    top_primary_label = top_primary[0][0] if top_primary else "-"
-
+    secondary_values = [r.get("Secondary Archetype", "") for r in records]
+    shadow_values = [r.get("Shadow Archetype", "") for r in records]
     hidden_values = [r.get("Hidden Code 1", "") for r in records]
-    top_hidden = Counter([v for v in hidden_values if v]).most_common(1)
-    top_hidden_label = top_hidden[0][0] if top_hidden else "-"
+    departments = [r.get("Department", "") for r in records]
+    roles = [r.get("Role", "") for r in records]
 
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Completed", completed)
-    col2.metric("Avg Alignment", f"{avg_alignment}/100")
-    col3.metric("Avg Growth", f"{avg_growth}/100")
-    col4.metric("Top Archetype", top_primary_label)
+    top_primary_label = _top_label(primary_values)
+    top_hidden_label = _top_label(hidden_values)
 
-    st.info(f"Most common hidden code: **{top_hidden_label}**")
+    st.header(f"{company_label} Team Intelligence")
 
-    st.divider()
-    render_distribution("Archetype Composition", primary_values)
+    tab_overview, tab_archetypes, tab_departments, tab_people, tab_ai, tab_export = st.tabs([
+        "Overview", "Archetypes", "Departments", "People", "AI Insight", "Export"
+    ])
 
-    st.divider()
-    render_distribution("Top Hidden Codes", hidden_values)
+    with tab_overview:
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Participants", completed)
+        col2.metric("Avg Alignment", f"{avg_alignment}/100")
+        col3.metric("Avg Growth", f"{avg_growth}/100")
+        col4.metric("Top Archetype", top_primary_label)
 
-    st.divider()
-    render_distribution("Department Breakdown", [r.get("Department", "") for r in records])
+        col5, col6, col7 = st.columns(3)
+        col5.metric("Top Hidden Code", top_hidden_label)
+        col6.metric("Departments", len(set([d for d in departments if str(d).strip()])))
+        col7.metric("Roles", len(set([r for r in roles if str(r).strip()])))
 
-    st.divider()
-    st.subheader("Recent Submissions")
-    for row in records[-10:][::-1]:
+        st.divider()
+        st.subheader("Team Snapshot")
         st.write(
-            f"**{row.get('Name', '-')}** | "
-            f"{row.get('Department', '-')} | "
-            f"{row.get('Primary Archetype', '-')} | "
-            f"Alignment {row.get('Alignment Index', '-')}/100 | "
-            f"Growth {row.get('Growth Potential', '-')}/100"
+            f"This dashboard currently contains **{completed} completed assessment(s)** for **{company_label}**. "
+            f"The team's average Alignment Index is **{avg_alignment}/100**, with average Growth Potential at **{avg_growth}/100**. "
+            f"The most common primary archetype is **{top_primary_label}**, and the most common hidden code is **{top_hidden_label}**."
         )
 
-    st.divider()
-    csv_data = records_to_csv(records)
-    st.download_button(
-        label="Download Dashboard Data (CSV)",
-        data=csv_data,
-        file_name=f"codeshift_dashboard_{company_label.replace(' ', '_')}.csv",
-        mime="text/csv",
-    )
+        st.divider()
+        left, right = st.columns(2)
+        with left:
+            _bar_distribution("Primary Archetype Snapshot", primary_values, max_items=6)
+        with right:
+            _bar_distribution("Hidden Code Snapshot", hidden_values, max_items=6)
 
+    with tab_archetypes:
+        col_a, col_b = st.columns(2)
+        with col_a:
+            _bar_distribution("Primary Archetype Distribution", primary_values)
+            st.divider()
+            _bar_distribution("Secondary Archetype Distribution", secondary_values)
+        with col_b:
+            _bar_distribution("Shadow Archetype Distribution", shadow_values)
+            st.divider()
+            _bar_distribution("Hidden Code Distribution", hidden_values)
+
+    with tab_departments:
+        st.subheader("Department Comparison")
+        dept_summary = _department_summary(records)
+
+        for item in dept_summary:
+            with st.container(border=True):
+                st.markdown(f"### {item['Department']}")
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Participants", item["Participants"])
+                c2.metric("Avg Alignment", f"{item['Avg Alignment']}/100")
+                c3.metric("Avg Growth", f"{item['Avg Growth']}/100")
+                c4.metric("Top Archetype", item["Top Archetype"])
+                st.caption(f"Top Hidden Code: {item['Top Hidden Code']}")
+
+    with tab_people:
+        st.subheader("Participant Explorer")
+        names = [r.get("Name", "") for r in records if r.get("Name", "")]
+
+        if not names:
+            st.info("No participant names available.")
+        else:
+            selected_name = st.selectbox("Select Participant", names)
+            selected_records = [r for r in records if r.get("Name", "") == selected_name]
+            person = selected_records[-1] if selected_records else None
+
+            if person:
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Alignment", f"{person.get('Alignment Index', '-')}/100")
+                c2.metric("Growth", f"{person.get('Growth Potential', '-')}/100")
+                c3.metric("Primary", person.get("Primary Archetype", "-"))
+
+                st.write(f"**Department:** {person.get('Department', '-')}")
+                st.write(f"**Role:** {person.get('Role', '-')}")
+                st.write(f"**Secondary:** {person.get('Secondary Archetype', '-')}")
+                st.write(f"**Shadow:** {person.get('Shadow Archetype', '-')}")
+                st.write(f"**Hidden Code:** {person.get('Hidden Code 1', '-')}")
+                st.write(f"**Protection Strategy:** {person.get('Protection Strategy', '-')}")
+
+        st.divider()
+        st.subheader("Recent Submissions")
+        for row in records[-10:][::-1]:
+            st.write(
+                f"**{row.get('Name', '-')}** | "
+                f"{row.get('Department', '-')} | "
+                f"{row.get('Primary Archetype', '-')} | "
+                f"Alignment {row.get('Alignment Index', '-')}/100 | "
+                f"Growth {row.get('Growth Potential', '-')}/100"
+            )
+
+    with tab_ai:
+        st.subheader("AI Executive Coach")
+        st.write(
+            "Generate a leadership-level interpretation of the team's working style, collaboration risks, "
+            "stress pattern and recommended workshop focus."
+        )
+
+        if st.button("Generate Executive Team Insight"):
+            with st.spinner("Analysing team patterns..."):
+                try:
+                    insight = _generate_team_insight(records, company_label)
+                    st.session_state["team_insight"] = insight
+                except Exception as error:
+                    st.error(f"Could not generate insight: {error}")
+
+        if st.session_state.get("team_insight"):
+            st.markdown(st.session_state["team_insight"])
+
+    with tab_export:
+        st.subheader("Export Data")
+        csv_data = records_to_csv(records)
+        st.download_button(
+            label="Download Dashboard Data (CSV)",
+            data=csv_data,
+            file_name=f"codeshift_dashboard_{company_label.replace(' ', '_')}.csv",
+            mime="text/csv",
+        )
+
+        if st.session_state.get("team_insight"):
+            st.download_button(
+                label="Download AI Team Insight (TXT)",
+                data=st.session_state["team_insight"],
+                file_name=f"codeshift_team_insight_{company_label.replace(' ', '_')}.txt",
+                mime="text/plain",
+            )
 
 def participant_view():
     st.title("CodeShift Identity Blueprint")
