@@ -7,6 +7,8 @@ import re
 import wave
 from datetime import datetime
 from collections import Counter
+import secrets as pysecrets
+import string
 import numpy as np
 import matplotlib.pyplot as plt
 from fpdf import FPDF
@@ -31,6 +33,13 @@ st.set_page_config(
 
 GOOGLE_SHEET_NAME = "CodeShift VoicePrint Database"
 RESPONSES_TAB = "Responses"
+ACCESS_TAB = "Access Control"
+
+ACCESS_HEADERS = [
+    "Created At", "Client", "Programme", "Department",
+    "Participant Code", "Leader Code", "HR Admin Code",
+    "Quota", "Start Date", "Expiry Date", "Status",
+]
 
 CLIENTS = {
     "MAXIS2026": {
@@ -67,18 +76,30 @@ def normalise_code(code):
 
 def get_client(access_code):
     code = normalise_code(access_code)
+
+    # Dynamic access codes created in Admin Portal
+    try:
+        for row in load_access_programmes():
+            if normalise_code(row.get("Participant Code", "")) == code:
+                return {
+                    "company": str(row.get("Client", "Unassigned")),
+                    "programme": str(row.get("Programme", "Unassigned")),
+                    "department": str(row.get("Department", "")),
+                    "quota": int(float(row.get("Quota", 0) or 0)),
+                    "status": str(row.get("Status", "Active")),
+                    "expiry": str(row.get("Expiry Date", "")),
+                }
+    except Exception:
+        pass
+
+    # Legacy hard-coded codes
     if code in CLIENTS:
         return CLIENTS[code]
-    return {"company": "Unassigned", "programme": "Unassigned", "quota": 0}
+
+    return {"company": "Unassigned", "programme": "Unassigned", "department": "", "quota": 0, "status": "Unknown", "expiry": ""}
 
 
-@st.cache_resource
-def get_google_worksheet():
-    """Connects to Google Sheets.
-
-    Local testing: put service-account.json in the same folder as app.py.
-    Streamlit Cloud: paste [google_service_account] into App Secrets.
-    """
+def _get_google_spreadsheet():
     if gspread is None or Credentials is None:
         return None, "Google Sheets libraries are not installed."
 
@@ -98,8 +119,19 @@ def get_google_worksheet():
         ]
         credentials = Credentials.from_service_account_info(service_account_info, scopes=scopes)
         google_client = gspread.authorize(credentials)
-        spreadsheet = google_client.open(GOOGLE_SHEET_NAME)
+        return google_client.open(GOOGLE_SHEET_NAME), None
+    except Exception as error:
+        return None, str(error)
 
+
+@st.cache_resource
+def get_google_worksheet():
+    """Connects to the Responses worksheet."""
+    spreadsheet, error = _get_google_spreadsheet()
+    if spreadsheet is None:
+        return None, error
+
+    try:
         try:
             worksheet = spreadsheet.worksheet(RESPONSES_TAB)
         except gspread.WorksheetNotFound:
@@ -111,9 +143,83 @@ def get_google_worksheet():
             worksheet.append_row(SHEET_HEADERS)
 
         return worksheet, None
-
     except Exception as error:
         return None, str(error)
+
+
+@st.cache_resource
+def get_access_worksheet():
+    """Connects to the Access Control worksheet."""
+    spreadsheet, error = _get_google_spreadsheet()
+    if spreadsheet is None:
+        return None, error
+
+    try:
+        try:
+            worksheet = spreadsheet.worksheet(ACCESS_TAB)
+        except gspread.WorksheetNotFound:
+            worksheet = spreadsheet.add_worksheet(title=ACCESS_TAB, rows=1000, cols=len(ACCESS_HEADERS))
+
+        existing_headers = worksheet.row_values(1)
+        if existing_headers != ACCESS_HEADERS:
+            worksheet.clear()
+            worksheet.append_row(ACCESS_HEADERS)
+
+        return worksheet, None
+    except Exception as error:
+        return None, str(error)
+
+
+def load_access_programmes():
+    worksheet, error = get_access_worksheet()
+    if worksheet is None:
+        return []
+    try:
+        return worksheet.get_all_records()
+    except Exception:
+        return []
+
+
+def _make_code(prefix, role=""):
+    clean_prefix = re.sub(r"[^A-Z0-9]", "", str(prefix).upper())[:8] or "CS"
+    suffix = "".join(pysecrets.choice(string.ascii_uppercase + string.digits) for _ in range(4))
+    parts = [clean_prefix]
+    if role:
+        parts.append(role)
+    parts.append(suffix)
+    return "-".join(parts)
+
+
+def create_access_programme(client, programme, department, quota, start_date, expiry_date, status="Active", hr_admin_code=None):
+    worksheet, error = get_access_worksheet()
+    if worksheet is None:
+        return False, error or "Access Control worksheet not connected.", None
+
+    prefix = f"{client[:3]}{department[:3]}"
+    participant_code = _make_code(prefix)
+    leader_code = _make_code(prefix, "LDR")
+    hr_code = hr_admin_code or _make_code(client[:3], "HR")
+
+    row = {
+        "Created At": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "Client": client,
+        "Programme": programme,
+        "Department": department,
+        "Participant Code": participant_code,
+        "Leader Code": leader_code,
+        "HR Admin Code": hr_code,
+        "Quota": quota,
+        "Start Date": str(start_date),
+        "Expiry Date": str(expiry_date),
+        "Status": status,
+    }
+
+    try:
+        worksheet.append_row([row.get(h, "") for h in ACCESS_HEADERS], value_input_option="USER_ENTERED")
+        get_access_worksheet.clear()
+        return True, "Programme created.", row
+    except Exception as error:
+        return False, str(error), None
 
 
 def count_completed(access_code):
@@ -800,21 +906,36 @@ def show_dashboard():
         return
 
     company_filter = None
+    department_filter = None
+    permission_label = ""
 
     if dashboard_code == "CODESHIFT-ADMIN":
         company_filter = "ALL"
+        permission_label = "CodeShift Admin"
     else:
-        for code, info in CLIENTS.items():
-            if dashboard_code == f"{code}-ADMIN" or dashboard_code == info.get("dashboard_code", ""):
-                company_filter = info["company"]
+        access_rows = load_access_programmes()
+        for row in access_rows:
+            if dashboard_code == normalise_code(row.get("Leader Code", "")):
+                company_filter = str(row.get("Client", "")).strip()
+                department_filter = str(row.get("Department", "")).strip()
+                permission_label = f"Department Leader - {department_filter}"
+                break
+            if dashboard_code == normalise_code(row.get("HR Admin Code", "")):
+                company_filter = str(row.get("Client", "")).strip()
+                permission_label = "Organisation Admin"
                 break
 
-    if dashboard_code == "MAXIS-ADMIN":
-        company_filter = "Maxis"
-    if dashboard_code == "AIA-ADMIN":
-        company_filter = "AIA Malaysia"
-    if dashboard_code == "EESSENCE-ADMIN":
-        company_filter = "eEssence Consultants"
+        # Legacy dashboard codes
+        if company_filter is None:
+            if dashboard_code == "MAXIS-ADMIN":
+                company_filter = "Maxis"
+                permission_label = "Organisation Admin"
+            if dashboard_code == "AIA-ADMIN":
+                company_filter = "AIA Malaysia"
+                permission_label = "Organisation Admin"
+            if dashboard_code == "EESSENCE-ADMIN":
+                company_filter = "eEssence Consultants"
+                permission_label = "Organisation Admin"
 
     if company_filter is None:
         st.error("Invalid dashboard access code.")
@@ -826,6 +947,12 @@ def show_dashboard():
         records = [
             row for row in records
             if str(row.get("Company", "")).strip() == company_filter
+        ]
+
+    if department_filter:
+        records = [
+            row for row in records
+            if str(row.get("Department", "")).strip() == department_filter
         ]
 
     if not records:
@@ -849,6 +976,8 @@ def show_dashboard():
     top_hidden_label = _top_label(hidden_values)
 
     st.header(f"{company_label} Team Intelligence")
+    if permission_label:
+        st.caption(f"Access level: {permission_label}")
 
     tab_overview, tab_archetypes, tab_departments, tab_people, tab_ai, tab_export = st.tabs([
         "Overview", "Archetypes", "Departments", "People", "AI Insight", "Export"
@@ -975,6 +1104,263 @@ def show_dashboard():
                 data=st.session_state["team_insight"],
                 file_name=f"codeshift_team_insight_{company_label.replace(' ', '_')}.txt",
                 mime="text/plain",
+            )
+
+
+
+def _csv_from_rows(rows, headers=None):
+    if not rows:
+        return ""
+    if headers is None:
+        headers = list(rows[0].keys())
+    lines = [headers]
+    for row in rows:
+        lines.append([str(row.get(h, "")) for h in headers])
+    return "\n".join([",".join([f'"{str(cell).replace(chr(34), chr(34)+chr(34))}"' for cell in line]) for line in lines])
+
+
+def _programme_key(row):
+    return f"{row.get('Client','')} | {row.get('Programme','')}"
+
+
+def _programme_summaries(access_rows):
+    summaries = {}
+    for row in access_rows:
+        key = _programme_key(row)
+        if key not in summaries:
+            summaries[key] = {
+                "Client": row.get("Client", ""),
+                "Programme": row.get("Programme", ""),
+                "Departments": 0,
+                "Quota": 0,
+                "Completed": 0,
+                "Status": row.get("Status", ""),
+                "Expiry Date": row.get("Expiry Date", ""),
+            }
+        summaries[key]["Departments"] += 1
+        try:
+            summaries[key]["Quota"] += int(float(row.get("Quota", 0) or 0))
+        except Exception:
+            pass
+        summaries[key]["Completed"] += count_completed(row.get("Participant Code", ""))
+    return summaries
+
+
+def _display_programme_details(selected_key, access_rows):
+    programme_rows = [r for r in access_rows if _programme_key(r) == selected_key]
+    if not programme_rows:
+        st.info("No programme selected.")
+        return
+
+    client = programme_rows[0].get("Client", "")
+    programme = programme_rows[0].get("Programme", "")
+    total_quota = 0
+    total_completed = 0
+
+    detail_rows = []
+    for row in programme_rows:
+        try:
+            quota = int(float(row.get("Quota", 0) or 0))
+        except Exception:
+            quota = 0
+        completed = count_completed(row.get("Participant Code", ""))
+        total_quota += quota
+        total_completed += completed
+        detail_rows.append({
+            "Department": row.get("Department", ""),
+            "Quota": quota,
+            "Completed": completed,
+            "Completion %": round(completed / quota * 100, 1) if quota else 0,
+            "Participant Code": row.get("Participant Code", ""),
+            "Leader Code": row.get("Leader Code", ""),
+            "HR Admin Code": row.get("HR Admin Code", ""),
+            "Status": row.get("Status", ""),
+            "Expiry Date": row.get("Expiry Date", ""),
+        })
+
+    st.subheader(f"{client} — {programme}")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Departments", len(programme_rows))
+    c2.metric("Quota", total_quota)
+    c3.metric("Completed", total_completed)
+    c4.metric("Completion", f"{round(total_completed / total_quota * 100, 1) if total_quota else 0}%")
+
+    tab_overview, tab_departments, tab_access, tab_export = st.tabs([
+        "Overview", "Departments", "Access Codes", "Export"
+    ])
+
+    with tab_overview:
+        st.write("Programme summary")
+        st.dataframe(detail_rows, use_container_width=True, hide_index=True)
+
+    with tab_departments:
+        for row in detail_rows:
+            with st.expander(f"{row['Department']} — {row['Completed']}/{row['Quota']} completed", expanded=False):
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Completed", row["Completed"])
+                c2.metric("Quota", row["Quota"])
+                c3.metric("Completion", f"{row['Completion %']}%")
+                st.write(f"Participant Code: `{row['Participant Code']}`")
+                st.write(f"Leader Dashboard Code: `{row['Leader Code']}`")
+                st.write(f"HR Admin Code: `{row['HR Admin Code']}`")
+
+    with tab_access:
+        st.dataframe(detail_rows, use_container_width=True, hide_index=True)
+
+    with tab_export:
+        csv_text = _csv_from_rows(detail_rows)
+        st.download_button(
+            "Download Programme Access CSV",
+            data=csv_text,
+            file_name=f"codeshift_{client}_{programme}_access.csv".replace(" ", "_"),
+            mime="text/csv",
+        )
+        st.caption("QR pack and executive PDF export will be added in the next sprint.")
+
+
+def show_admin_portal():
+    st.title("CodeShift Admin Portal")
+    st.caption("Create and manage clients, programmes, access codes and dashboard permissions.")
+
+    admin_code = st.text_input("CodeShift Admin Code", type="password").strip().upper()
+    if admin_code != "CODESHIFT-ADMIN":
+        st.info("Enter CodeShift admin code to continue.")
+        return
+
+    access_rows = load_access_programmes()
+
+    tab_overview, tab_programmes, tab_new, tab_access = st.tabs([
+        "Overview", "Programmes", "New Programme", "Access Codes"
+    ])
+
+    with tab_overview:
+        st.subheader("Platform Overview")
+        summaries = _programme_summaries(access_rows)
+        clients = sorted(set(str(r.get("Client", "")) for r in access_rows if r.get("Client", "")))
+        total_quota = sum(s.get("Quota", 0) for s in summaries.values())
+        total_completed = sum(s.get("Completed", 0) for s in summaries.values())
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Clients", len(clients))
+        c2.metric("Programmes", len(summaries))
+        c3.metric("Quota", total_quota)
+        c4.metric("Completed", total_completed)
+
+        if summaries:
+            table = []
+            for key, s in summaries.items():
+                table.append({
+                    "Client": s["Client"],
+                    "Programme": s["Programme"],
+                    "Departments": s["Departments"],
+                    "Completed": f"{s['Completed']}/{s['Quota']}",
+                    "Completion %": round(s["Completed"] / s["Quota"] * 100, 1) if s["Quota"] else 0,
+                    "Status": s["Status"],
+                    "Expiry Date": s["Expiry Date"],
+                })
+            st.dataframe(table, use_container_width=True, hide_index=True)
+        else:
+            st.info("No programmes created yet.")
+
+    with tab_programmes:
+        st.subheader("Programme Manager")
+        summaries = _programme_summaries(access_rows)
+        if not summaries:
+            st.info("No programmes created yet. Use the New Programme tab.")
+        else:
+            options = list(summaries.keys())
+            selected = st.selectbox("Select Programme", options)
+            _display_programme_details(selected, access_rows)
+
+    with tab_new:
+        st.subheader("Create New Programme")
+        client_name = st.text_input("Client / Organisation", placeholder="AIA")
+        programme_name = st.text_input("Programme", placeholder="Contact Centre Leadership Lab")
+        default_start = datetime.now().date()
+        start_date = st.date_input("Start Date", value=default_start)
+        expiry_date = st.date_input("Expiry Date")
+        status = st.selectbox("Status", ["Active", "Inactive"], index=0)
+        shared_hr_code = st.checkbox("Use one HR admin code for all departments", value=True)
+        manual_hr_code = st.text_input("HR Admin Code (optional)", placeholder="Leave blank to auto-generate")
+
+        st.markdown("**Departments and quotas**")
+        st.caption("Enter one department per line. Format: Department, Quota")
+        dept_text = st.text_area(
+            "Departments",
+            value="Contact Centre, 120\nUnderwriting, 80\nClaims, 60",
+            height=120,
+        )
+
+        if st.button("Generate Access Codes"):
+            if not client_name or not programme_name or not dept_text.strip():
+                st.error("Please enter client, programme and at least one department.")
+                return
+
+            department_rows = []
+            for line in dept_text.splitlines():
+                if not line.strip():
+                    continue
+                parts = [p.strip() for p in line.split(",")]
+                department = parts[0]
+                try:
+                    quota = int(parts[1]) if len(parts) > 1 and parts[1] else 0
+                except Exception:
+                    quota = 0
+                department_rows.append((department, quota))
+
+            if not department_rows:
+                st.error("No valid departments found.")
+                return
+
+            hr_code = manual_hr_code.strip().upper() if manual_hr_code.strip() else None
+            if shared_hr_code and not hr_code:
+                hr_code = _make_code(client_name[:3], "HR")
+
+            created = []
+            for department, quota in department_rows:
+                ok, msg, row = create_access_programme(
+                    client=client_name.strip(),
+                    programme=programme_name.strip(),
+                    department=department,
+                    quota=quota,
+                    start_date=start_date,
+                    expiry_date=expiry_date,
+                    status=status,
+                    hr_admin_code=hr_code if shared_hr_code else None,
+                )
+                if ok and row:
+                    created.append(row)
+                else:
+                    st.error(f"Could not create {department}: {msg}")
+
+            if created:
+                st.success(f"Created {len(created)} access record(s).")
+                csv_text = _csv_from_rows(created, ACCESS_HEADERS)
+                st.download_button(
+                    "Download Newly Created Access Codes CSV",
+                    data=csv_text,
+                    file_name=f"codeshift_{client_name}_{programme_name}_new_access.csv".replace(" ", "_"),
+                    mime="text/csv",
+                )
+                for row in created:
+                    with st.expander(f"{row['Client']} - {row['Department']}", expanded=True):
+                        st.write(f"Participant Code: `{row['Participant Code']}`")
+                        st.write(f"Leader Dashboard Code: `{row['Leader Code']}`")
+                        st.write(f"HR Admin Code: `{row['HR Admin Code']}`")
+                        st.write(f"Quota: {row['Quota']} | Status: {row['Status']} | Expiry: {row['Expiry Date']}")
+
+    with tab_access:
+        st.subheader("All Access Codes")
+        if not access_rows:
+            st.info("No access codes created yet.")
+        else:
+            st.dataframe(access_rows, use_container_width=True, hide_index=True)
+            csv_text = _csv_from_rows(access_rows, ACCESS_HEADERS)
+            st.download_button(
+                "Download All Access Codes CSV",
+                data=csv_text,
+                file_name="codeshift_all_access_codes.csv",
+                mime="text/csv",
             )
 
 def participant_view():
@@ -1260,10 +1646,12 @@ def participant_view():
 
 mode = st.sidebar.radio(
     "Mode",
-    ["Participant Assessment", "Client Dashboard"]
+    ["Participant Assessment", "Client Dashboard", "CodeShift Admin"]
 )
 
 if mode == "Participant Assessment":
     participant_view()
-else:
+elif mode == "Client Dashboard":
     show_dashboard()
+else:
+    show_admin_portal()
